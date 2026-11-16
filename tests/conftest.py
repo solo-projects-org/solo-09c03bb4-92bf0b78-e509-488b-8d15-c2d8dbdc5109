@@ -65,14 +65,15 @@ class Service:
         self._env = env
         self._app_dir = app_dir
 
-    def start(self):
+    def start(self, wait: bool = True):
         env = {**os.environ, **self._env, "PYTHONPATH": str(self._app_dir)}
         self.proc = subprocess.Popen(
             [sys.executable, "-I", "-m", "uvicorn",
              "app.main:app", "--host", "127.0.0.1", "--port", str(self.port)],
             cwd=str(self._app_dir), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        _wait_healthy(f"{self.base}/health")
+        if wait:
+            _wait_healthy(f"{self.base}/health")
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -89,6 +90,12 @@ class Service:
 
     def restart(self):
         self.stop()
+        self.start()
+
+    def set_env(self, **changes):
+        """重启服务并注入/覆盖环境变量（故障演练用）。"""
+        self.stop()
+        self._env = {**self._env, **changes}
         self.start()
 
 
@@ -111,7 +118,9 @@ def stack(tmp_path):
         "BLOB_DIR": str(api_data / "blobs"),
         "KEY_SERVICE_URL": f"http://127.0.0.1:{kport}",
         "KEY_SERVICE_TOKEN": TOKEN,
-        "UPLOAD_STALE_SECONDS": "2",
+        # 活跃在途上传在轮换销毁前必须完成改绑，不能被误判僵死。
+        # 取 30s 避免 2.5s 的慢上传与“僵死超时”竞态（生产默认 3600）。
+        "UPLOAD_STALE_SECONDS": "30",
     })
     key_svc.start()
     api_svc.start()

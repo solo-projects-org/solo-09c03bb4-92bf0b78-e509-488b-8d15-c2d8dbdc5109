@@ -31,25 +31,40 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 ```
 
 状态机：`migrating`（逐信封 rewrap，blob 正文不动）→ `destroying`
-（零残留核验 + 销毁旧 MK + 只读核实）→ `completed`。
-进行中再次发起轮换返回 409。作业失败时先查 `error` 字段，修复后
-（通常是密钥服务暂时不可达）重启 API 即可自动接续，无需手工干预。
+（零残留核验 + 抽样核实可读 + 销毁旧 MK + 只读核实）→ `completed`。
+
+密钥服务暂时不可达（连接失败/5xx）时作业进入 **`retrying`**（非终态），
+按指数退避持续重试；`error`/`attempts`/`next_retry_at` 可查。等待期间上传/
+下载照常，作业持续阻塞新轮换。服务恢复即自动继续，**无需重启 API**。
+
+只有确定性错误才落 `failed`：`permanent=1` 表示不可自动恢复（如旧 MK 已被
+外部销毁、信封无法解包）；`permanent=0` 的 `failed`（旧版本遗留/瞬时故障）
+会在启动或空闲时自动重新入队接续。仍有 `ready/receiving` 行依赖旧 MK 时，
+`POST /rotations` 返回 `409 rotation_pending_dependencies`，必须先完成续作。
 
 ## 4. 故障演练开关（keystore）
 
 - `KEY_OP_DELAY=<秒>`：模拟慢密钥服务，验证在线流量不被轮换拖死。
 - `KEY_DESTROY_DROP_RECEIPT=true`：销毁落盘后丢弃 HTTP 回执，验证 API
   自动重试 + 只读状态核实、作业仍如实报 completed。
+- `KEY_FAIL_OPS=rewrap,unwrap`（逗号分隔，可选 rotate/generate/destroy）：
+  指定操作返回 503，验证作业进入 `retrying` 而非误判失败；清空该变量并重启
+  密钥服务即可验证自动接续。注意生产排障时不要保留此变量。
+- `ROTATION_VERIFY_SAMPLE`（API 侧，默认 50）：销毁前抽样的 ready 原片数，
+  设为 0 关闭抽样（不建议）。
 
 ## 5. 崩溃/重启语义
 
 | 场景 | 行为 |
 |---|---|
 | API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布）；blob 残片可按 failed 行清理 |
-| API 在轮换中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
-| 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
+| API 在轮换中崩溃 | 重启后后台线程自动接续 `migrating/retrying/destroying` 到终态 |
+| 轮换作业已 failed（旧版本遗留） | 启动/空闲时自动重新入队接续；`permanent=1` 除外 |
+| 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业；启动时密钥服务不可达则在空闲期对账补建 |
+| 密钥服务短暂不可用 | 作业停留 `retrying` 并退避重试；恢复后自动继续，不误报失败 |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
 | 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |
+| 旧版元数据库 | 启动自动升级 `rotation_jobs`（新增 `retrying`/`attempts`/`permanent` 等），历史作业保留 |
 
 ## 6. 已知限制（单实例/SQLite 范围之外）
 
@@ -61,4 +76,9 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 4. GCM 帧验签失败发生在流式响应开始之后，表现为连接中断（HTTP 流无法
    再改状态码）；客户端应将不完整响应当作失败，可重新 GET 重试。
 5. 销毁 MK 是不可逆操作；销毁前系统保证无 ready/receiving 行依赖它，
-   但 failed 历史行的信封将永久无法解包（这些原片本就不可读）。
+   并抽样核实迁移后的信封可解包，然后才销毁；销毁后再以只读 status 核实。
+   若旧 MK 在作业以外被提前销毁，仍依赖它的行会被如实标 `failed`
+   （下载返回 409），对应作业置 `permanent=1`，不会再自动重试。
+6. 轮换线程是单实例内的常驻协程；多实例部署前必须先做分布式轮换锁，
+   否则两个实例可能同时驱动同一作业（条件 UPDATE 能防信封覆盖，但无法
+   防止重复销毁/重复对账）。

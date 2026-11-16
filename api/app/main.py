@@ -34,6 +34,7 @@ MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
 from .keyclient import KeyClient, KeyServiceError
 from .metadata import MetadataDB
+from .reconcile import reconcile_rotations
 from .rotation import RotationWorker
 
 db = MetadataDB(DB_PATH)
@@ -61,21 +62,16 @@ async def lifespan(app: FastAPI):
     stale = db.mark_stale_receiving_failed()
     if stale:
         print(f"[startup] {stale} interrupted upload(s) marked failed")
-    # 崩溃对账：上次可能已在密钥服务切换了 MK、却没来得及建本地作业
+    # 重启即视为运维介入：清掉退避等待，retrying 作业立即重试迁移
+    retrying = db.clear_retry_backoff()
+    if retrying:
+        print(f"[startup] {retrying} retrying rotation job(s) cleared for retry")
+    # 崩溃对账：补齐"MK 已切换、作业未建"窗口；失败/中断作业的续作由后台
+    # 线程统一负责（见 RotationWorker），避免两条路径同时驱动同一作业。
     try:
-        key_status = await keys.master_status()
-        current_mk = key_status.get("current_key_id")
-        for key in key_status.get("keys", []):
-            if (key["key_id"] != current_mk
-                    and key["state"] == "active"
-                    and not db.has_rotation_for(key["key_id"])):
-                job_id = db.create_rotation(
-                    key["key_id"], current_mk,
-                    db.count_under_key(key["key_id"], only_migratable=True))
-                print(f"[startup] reconciled missing rotation job {job_id} "
-                      f"for {key['key_id']}")
+        await reconcile_rotations(db, keys)
     except KeyServiceError as exc:
-        print(f"[startup] rotation reconciliation skipped: {exc}")
+        print(f"[startup] rotation reconciliation deferred: {exc}")
     worker = RotationWorker(db, keys, main_loop)
     worker.start()
     yield
@@ -121,12 +117,22 @@ async def _finalize_with_rebind(image_id: str, stats: dict[str, Any]) -> dict[st
     """最终化原片；若其 MK 在上传期间已被轮换切换，则先 rewrap 改绑当前 MK。
 
     是否需要改绑只依据本地轮换记录判断（不额外依赖密钥服务在线）：
-    该行绑定的正是最近一次轮换的旧 MK 时，说明它是跨越轮换的在途上传。
-    防止在途上传晚发布依赖旧（甚至已销毁）主密钥的原片。
+    该行绑定的 MK 若是某次轮换的旧密钥，说明它是跨越轮换的在途上传，必须先
+    改绑再发布。防止在途上传晚发布依赖旧（甚至已销毁）主密钥的原片。
     """
     meta = db.get_image(image_id)
-    job = db.latest_rotation()
-    if job and meta and meta["master_key_id"] == job["old_key_id"]:
+    if meta is None:
+        raise HTTPException(404, detail="image not found")
+    if meta["status"] != "receiving":
+        # 轮换线程可能已把该行判失败（旧密钥被外部销毁/僵死超时）：
+        # 绝不能再把它发布成 ready。
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "upload_no_longer_receiving",
+                    "message": f"upload was marked {meta['status']}: "
+                               f"{meta.get('error') or ''}"})
+    job = db.rotation_for_key(meta["master_key_id"])
+    if job is not None:
         try:
             res = await keys.rewrap(meta["master_key_id"], meta["wrapped_dek"],
                                     f"finalize:{image_id}")
@@ -141,8 +147,12 @@ async def _finalize_with_rebind(image_id: str, stats: dict[str, Any]) -> dict[st
             raise
         db.rewrap_row(image_id, meta["master_key_id"],
                       res["key_id"], res["wrapped_dek"])
-    db.finalize_image(image_id, stats["plain_size"], stats["enc_size"],
-                      stats["sha256"])
+    if not db.finalize_image(image_id, stats["plain_size"], stats["enc_size"],
+                             stats["sha256"]):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "upload_no_longer_receiving",
+                    "message": "upload row changed state before finalize"})
     return db.get_image(image_id)
 
 
@@ -184,8 +194,11 @@ async def upload_image(request: Request, response: Response,
         if stats["plain_size"] > MAX_UPLOAD_BYTES:
             raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
         final = await _finalize_with_rebind(image_id, stats)
-    except HTTPException:
-        db.fail_image(image_id, "upload rejected")
+    except HTTPException as exc:
+        # 保留更具体的失败原因（如 old_key_destroyed / 行已被轮换判失败）
+        reason = exc.detail if isinstance(exc.detail, str) else \
+            (exc.detail or {}).get("code", "upload rejected")
+        db.fail_image(image_id, f"upload rejected: {reason}")
         try:
             os.remove(blob_path)
         except OSError:
@@ -237,8 +250,11 @@ async def upload_image_named(image_id: str, request: Request, response: Response
     try:
         stats = await _stream_to_blob(request, blob_path, dek)
         final = await _finalize_with_rebind(image_id, stats)
-    except HTTPException:
-        db.fail_image(image_id, "upload rejected")
+    except HTTPException as exc:
+        # 保留更具体的失败原因（如 old_key_destroyed / 行已被轮换判失败）
+        reason = exc.detail if isinstance(exc.detail, str) else \
+            (exc.detail or {}).get("code", "upload rejected")
+        db.fail_image(image_id, f"upload rejected: {reason}")
         try:
             os.remove(blob_path)
         except OSError:
@@ -338,19 +354,35 @@ class RotationRequest(BaseModel):
 
 
 @app.post("/rotations", status_code=202,
-          summary="发起主密钥轮换（迁移信封后销毁旧 MK；未完拒绝新轮换）")
+          summary="发起主密钥轮换（迁移信封后销毁旧 MK；未完或有旧依赖拒绝新轮换）")
 async def create_rotation(_: RotationRequest):
     active = db.active_rotation()
     if active is not None:
         raise HTTPException(
             409, detail={"code": "rotation_in_progress",
                          "job_id": active["job_id"], "state": active["state"]})
+    # 旧依赖未清除前拒绝新轮换：失败/遗留作业若仍有 ready/receiving 行绑定
+    # 其旧 MK，再轮换只会切换当前 MK，旧依赖仍在且永不被销毁，必须先接续旧作业。
+    pending = db.pending_dependency_rotation()
+    if pending is not None:
+        raise HTTPException(
+            409, detail={"code": "rotation_pending_dependencies",
+                         "job_id": pending["job_id"], "state": pending["state"],
+                         "old_key_id": pending["old_key_id"],
+                         "remaining": pending["remaining"]})
     try:
         rot = await keys.rotate_master()  # 新入湖立即改用新 MK
         old_key, new_key = rot["old_key_id"], rot["new_key_id"]
         total = (db.count_under_key(old_key, only_migratable=True)
                  if old_key else 0)
-        job_id = db.create_rotation(old_key, new_key, total)
+        try:
+            job_id = db.create_rotation(old_key, new_key, total)
+        except RuntimeError:
+            # 并发的另一请求先建立了作业（或恰有失败作业待接续）。
+            # 新 MK 已经切换，后续由对账/接续线程处理旧 MK，这里如实返回 409。
+            raise HTTPException(
+                409, detail={"code": "rotation_in_progress",
+                             "message": "another rotation was started concurrently"})
     except KeyServiceError as exc:
         raise _key_error(exc)
     return {"job_id": job_id, "state": "migrating", "old_key_id": old_key,
@@ -374,9 +406,13 @@ async def rotation_status(job_id: str):
 
 
 def _rotation_view(job: dict) -> dict:
-    total = max(job["total"], job["migrated"] + job["failed"], 1)
-    pct = round(100.0 * (job["migrated"] + job["failed"]) / total, 2)
-    return {**{k: v for k, v in job.items()}, "progress_percent": pct}
+    # 进度如实来自计数；completed 恒为 100（含“零原片轮换”），终态失败停在实际值
+    if job["state"] == "completed":
+        pct = 100.0
+    else:
+        total = max(job["total"], job["migrated"] + job["failed"], 1)
+        pct = round(100.0 * (job["migrated"] + job["failed"]) / total, 2)
+    return {**job, "progress_percent": pct}
 
 
 @app.get("/keys/status", summary="密钥视角状态（代理密钥服务只读接口）")

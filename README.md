@@ -84,11 +84,17 @@ watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 ## 轮换语义（需求对照）
 
 1. `POST /rotations` 先在密钥服务生成并切换新 MK——**新入湖立即使用新 MK**；
-   本地建作业（状态持久化），未完成时再次发起返回 `409 rotation_in_progress`。
+   本地建作业（状态持久化）。有未完成作业、或仍有旧依赖未清除时返回 `409`
+   （`rotation_in_progress` / `rotation_pending_dependencies`）。
 2. 后台常驻线程逐行把旧 MK 包裹的 DEK 调密钥服务 `rewrap` 改包到新 MK，
    **只更新元数据里的 64 字节信封，blob 密文正文逐字节不动**。
-3. 销毁前两次零残留核验（扫描后 + 销毁前），确认没有 `ready/receiving` 行
-   仍依赖旧 MK，才调用销毁；销毁后再用只读 `status` 核实，**不提前报完成**。
+3. 密钥服务暂时不可用（连接失败/5xx）时作业进入 **`retrying`（非终态）**：
+   带指数退避（0.5s→30s 封顶）一直重试，**不会误判 `failed`**；等待期间
+   上传/下载照常，作业持续阻塞新轮换。
+4. 销毁前两次零残留核验（扫描后 + 销毁前），确认没有 `ready/receiving` 行
+   仍依赖旧 MK，并抽样调 `unwrap` 核实迁移后的信封确实可读，才调用销毁；
+   销毁后再用只读 `status` 核实，**不提前报完成**。作业在销毁核验前绝不报
+   `completed`。
 4. **在途下载**：下载开始时只向密钥服务解包一次 DEK，之后帧解密完全在 API
    进程内存完成；即使下载很慢、期间旧 MK 被销毁，下载仍完整成功。
 5. **在途上传**：上传期间发生轮换时，finalize 会先 rewrap 改绑当前 MK 再发布；
@@ -97,8 +103,15 @@ watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 6. **慢密钥服务不阻塞**：迁移在独立线程、按批让出；在线上传/下载照常完成。
 7. **回执丢失**：`destroy` 网络层失败/连接被重置时，API 自动重试并以只读状态
    核实销毁是否真实生效；rewrap 带幂等令牌，重放返回同一结果。
-8. **进程重启接续**：轮换作业状态在 SQLite；API 重启后自动驱动未完成作业到
-   终态；若崩溃发生在“MK 已切换、作业未建”窗口，启动时自动对账补建作业。
+8. **进程重启接续**：轮换作业状态在 SQLite；API 重启后自动驱动
+   `migrating/retrying/destroying` 作业到终态。旧版本遗留、`permanent=0` 的
+   `failed` 作业也会在启动/空闲时自动重新入队接续；若崩溃发生在“MK 已切换、
+   作业未建”窗口，或启动时密钥服务不可达，启动及空闲期对账都会补建作业。
+9. **如实状态**：`migrated` 只计确实脱离旧 MK 的行，`failed` 单独计轮换期间
+   判失败的僵死在途上传；`completed` 仅在销毁经只读核实后写入；
+   `retrying` 保留 `attempts`/`next_retry_at`/`error` 供排障。
+10. **旧库升级**：`rotation_jobs` 缺 `retrying` 状态或新列时，启动自动重建表
+    并保留历史作业（旧 `failed` 视为可接续），迁移失败整体回滚。
 
 ## 故障注入（演练用，密钥服务环境变量）
 
@@ -106,6 +119,8 @@ watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 |---|---|
 | `KEY_OP_DELAY=0.3` | 每个密钥操作人为延迟 0.3s，模拟慢密钥服务 |
 | `KEY_DESTROY_DROP_RECEIPT=true` | 销毁成功落盘后故意不回完整 HTTP 响应，模拟销毁后丢回执 |
+| `KEY_FAIL_OPS=rewrap,unwrap` | 指定操作（rotate/rewrap/unwrap/generate/destroy）返回 503，模拟密钥服务短暂不可用 |
+| `ROTATION_VERIFY_SAMPLE=50`（API） | 销毁前抽样核实可读的 ready 原片数，`0` 关闭抽样 |
 
 ```bash
 KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
@@ -114,7 +129,7 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（27 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
@@ -124,6 +139,11 @@ python -m pytest tests/ -q
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
 跨越轮换的上传自动改绑。
+
+新增恢复用例（`tests/test_recovery.py`）：密钥服务 rewrap 持续 503 时作业停留
+`retrying`、拒绝新轮换、期间入仓/下载照常且密文正文不变；服务恢复后自动接续、
+销毁旧 MK 并如实计数；遗留 `failed` 作业在 API 重启后自动续作；旧依赖未清除时
+元数据层阻塞新轮换；旧版 `rotation_jobs` 结构就地升级。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 

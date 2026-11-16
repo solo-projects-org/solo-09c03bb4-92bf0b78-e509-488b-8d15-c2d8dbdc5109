@@ -8,6 +8,8 @@
 可配置故障注入（用于演练"回执丢失"与慢操作）：
   KEY_OP_DELAY               每个写/密码学操作人为延迟秒数（慢密钥服务）
   KEY_DESTROY_DROP_RECEIPT   销毁主密钥成功后不回 HTTP 响应（模拟回执丢失）
+  KEY_FAIL_OPS               逗号分隔的操作名（rotate,rewrap,unwrap,generate,
+                             destroy）返回 503，模拟密钥服务暂时不可用
   KEY_SERVICE_TOKEN          内部服务间鉴权令牌（必填，默认随机仅用于本地）
   KEYSTORE_DB                SQLite 路径（默认 /data/keystore.db，需持久卷）
 """
@@ -30,6 +32,9 @@ SERVICE_TOKEN = os.environ.get("KEY_SERVICE_TOKEN", "dev-only-key-service-token"
 OP_DELAY = float(os.environ.get("KEY_OP_DELAY", "0"))
 DESTROY_DROP_RECEIPT = os.environ.get(
     "KEY_DESTROY_DROP_RECEIPT", "false").lower() in ("1", "true", "yes")
+# 演练“密钥服务短暂不可用”：指定操作一律返回 503（不影响只读 status）
+FAIL_OPS = {op.strip().lower() for op in
+            os.environ.get("KEY_FAIL_OPS", "").split(",") if op.strip()}
 
 app = FastAPI(
     title="Microscopy Key Service",
@@ -63,6 +68,15 @@ async def _delay():
 def _biz(exc: KeyError_) -> HTTPException:
     return HTTPException(status_code=exc.status_code,
                          detail={"code": exc.code, "message": exc.message})
+
+
+def _maybe_fail(op: str):
+    """故障注入：把指定操作模拟成密钥服务暂时不可用（503）。"""
+    if op in FAIL_OPS:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "key_service_unavailable",
+                    "message": f"injected failure for {op}"})
 
 
 class WrapBody(BaseModel):
@@ -103,6 +117,7 @@ async def current_master(x_key_service_token: str | None = Header(default=None))
 async def rotate_master(x_key_service_token: str | None = Header(default=None),
                         x_idempotency_token: str | None = Header(default=None)):
     _check_token(x_key_service_token)
+    _maybe_fail("rotate")
     await _delay()
     return store.rotate_master(
         x_idempotency_token or f"auto-{uuid.uuid4()}")
@@ -112,6 +127,7 @@ async def rotate_master(x_key_service_token: str | None = Header(default=None),
 async def destroy_master(body: DestroyBody, request: Request,
                          x_key_service_token: str | None = Header(default=None)):
     _check_token(x_key_service_token)
+    _maybe_fail("destroy")
     await _delay()
     try:
         result = store.destroy_master(body.key_id)
@@ -132,6 +148,7 @@ async def master_status(x_key_service_token: str | None = Header(default=None)):
 @app.post("/internal/dek/generate", summary="生成 DEK 并用当前主密钥包裹")
 async def generate_dek(x_key_service_token: str | None = Header(default=None)):
     _check_token(x_key_service_token)
+    _maybe_fail("generate")
     await _delay()
     try:
         return store.generate_dek()
@@ -143,6 +160,7 @@ async def generate_dek(x_key_service_token: str | None = Header(default=None)):
 async def unwrap_dek_endpoint(body: WrapBody,
                               x_key_service_token: str | None = Header(default=None)):
     _check_token(x_key_service_token)
+    _maybe_fail("unwrap")
     await _delay()
     try:
         return store.unwrap(body.key_id, body.wrapped_dek)
@@ -156,6 +174,7 @@ async def rewrap_dek(body: RewrapBody,
                      x_key_service_token: str | None = Header(default=None),
                      x_idempotency_token: str | None = Header(default=None)):
     _check_token(x_key_service_token)
+    _maybe_fail("rewrap")
     await _delay()
     token = x_idempotency_token or f"auto-{uuid.uuid4()}"
     try:
